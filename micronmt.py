@@ -31,8 +31,8 @@ with open(extracted_file, encoding="utf-8") as f:
         target_texts.append(f"<start> {jpn} <end>")
 
 # (Optional) Subsample for speed during testing
-input_texts = input_texts[:4048]
-target_texts = target_texts[:4048]
+input_texts = input_texts[:5000]
+target_texts = target_texts[:5000]
 
 
 # Tokenizers for both languages
@@ -114,7 +114,7 @@ model, encoder_model, decoder_model = build_seq2seq_model(
 model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
 # Train
-model.fit([encoder_input, decoder_input], decoder_target, epochs=500, batch_size=2024)
+model.fit([encoder_input, decoder_input], decoder_target, epochs=5000, batch_size=1024)
 
 # === Inference Setup ===
 
