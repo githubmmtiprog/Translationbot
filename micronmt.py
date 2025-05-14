@@ -1,3 +1,4 @@
+import os
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras.preprocessing.text import Tokenizer
@@ -5,29 +6,18 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 import numpy as np
 
 # Input/output sentence pairs (English to Japanese)
-import urllib.request
 import zipfile
-import os
 
-dataset_url = "https://github.com/makcedward/nlpaug/blob/master/example/jpn-eng.zip?raw=true"
 dataset_path = "jpn-eng.zip"
 extracted_file = "jpn.txt"
 
 if not os.path.exists(extracted_file):
-    print("Downloading dataset...")
-
-    req = urllib.request.Request(
-        dataset_url,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-
-    with urllib.request.urlopen(req) as response:
-        with open(dataset_path, 'wb') as out_file:
-            out_file.write(response.read())
-
     with zipfile.ZipFile(dataset_path, 'r') as zip_ref:
         zip_ref.extractall()
     print("Dataset extracted.")
+else:
+    print("Already extracted.")
+
 
 
 # Read and preprocess the data
@@ -41,8 +31,8 @@ with open(extracted_file, encoding="utf-8") as f:
         target_texts.append(f"<start> {jpn} <end>")
 
 # (Optional) Subsample for speed during testing
-input_texts = input_texts[:10000]
-target_texts = target_texts[:10000]
+input_texts = input_texts[:4048]
+target_texts = target_texts[:4048]
 
 
 # Tokenizers for both languages
@@ -124,10 +114,9 @@ model, encoder_model, decoder_model = build_seq2seq_model(
 model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 
 # Train
-model.fit([encoder_input, decoder_input], decoder_target, epochs=100, batch_size=64)
+model.fit([encoder_input, decoder_input], decoder_target, epochs=500, batch_size=2024)
 
 # === Inference Setup ===
-
 
 
 # Decoding function
@@ -152,23 +141,20 @@ def decode_sequence(input_seq, max_target_len, start_token, end_token):
 
 
 # === Test the model with new inputs ===
-new_inputs = ["Hi", "good evening"]
-for sentence in new_inputs:
-    seq = input_tokenizer.texts_to_sequences([sentence])
+print("Translation ready. Type English sentences to translate them to Japanese.")
+print("Type 'exit' to quit.\n")
+
+while True:
+    user_input = input("You: ").strip()
+    if user_input.lower() == 'exit':
+        print("Exiting translation.")
+        break
+
+    # Tokenize and pad the input
+    seq = input_tokenizer.texts_to_sequences([user_input.lower()])
     padded_seq = pad_sequences(seq, maxlen=max_input_len, padding='post')
+
+    # Translate and print the result
     translated = decode_sequence(padded_seq, max_target_len, start_token="<start>", end_token="<end>")
-    print(f"Input: {sentence}\nGenerated: {translated}\n")
-
-    import gradio as gr
-
-def translate_input(text):
-    seq = input_tokenizer.texts_to_sequences([text])
-    padded = pad_sequences(seq, maxlen=max_input_len, padding='post')
-    result = decode_sequence(padded, max_target_len, start_token="<start>", end_token="<end>")
-    return result
-
-gr.Interface(fn=translate_input,
-             inputs=gr.Textbox(lines=2, label="English Input"),
-             outputs=gr.Textbox(label="Japanese Output"),
-             title="Mini NMT: English to Japanese").launch(share=True)
+    print("Japanese:", translated, "\n")
 
