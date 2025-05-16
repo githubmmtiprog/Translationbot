@@ -11,7 +11,6 @@ from torch.utils.data import Dataset, DataLoader
 # ----------------------------
 SRC_LANG = 'ja'
 TGT_LANG = 'en'
-VOCAB_SIZE = 8000
 MAX_LEN = 64
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -21,10 +20,10 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 def train_tokenizers():
     if not os.path.exists(f"{SRC_LANG}.model"):
         spm.SentencePieceTrainer.Train(
-            input=f"{SRC_LANG}.txt", model_prefix=SRC_LANG, vocab_size=VOCAB_SIZE)
+            input=f"{SRC_LANG}.txt", model_prefix=SRC_LANG, vocab_size=8000)
     if not os.path.exists(f"{TGT_LANG}.model"):
         spm.SentencePieceTrainer.Train(
-            input=f"{TGT_LANG}.txt", model_prefix=TGT_LANG, vocab_size=VOCAB_SIZE)
+            input=f"{TGT_LANG}.txt", model_prefix=TGT_LANG, vocab_size=8000)
 
 # ----------------------------
 # Step 2: Dataset
@@ -40,9 +39,10 @@ class TranslationDataset(Dataset):
         return len(self.src)
 
     def encode(self, line, tokenizer):
-        tokens = tokenizer.encode(line)
+        tokens = [tokenizer.bos_id()] + tokenizer.encode(line) + [tokenizer.eos_id()]
         tokens = tokens[:MAX_LEN]
-        tokens += [0] * (MAX_LEN - len(tokens))
+        pad_id = tokenizer.pad_id() if tokenizer.pad_id() >= 0 else 0
+        tokens += [pad_id] * (MAX_LEN - len(tokens))
         return torch.tensor(tokens)
 
     def __getitem__(self, idx):
@@ -91,8 +91,8 @@ class Seq2SeqTransformer(nn.Module):
 # ----------------------------
 # Step 4: Training
 # ----------------------------
-def train_model(model, dataloader, optimizer, loss_fn):
-    model.train()
+def train_model(model, dataloader, optimizer, loss_fn, pad_idx, checkpoint_dir="checkpoints"):
+    os.makedirs(checkpoint_dir, exist_ok=True)
     for epoch in range(10):
         total_loss = 0
         for src, tgt in dataloader:
@@ -109,7 +109,35 @@ def train_model(model, dataloader, optimizer, loss_fn):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+        
+        # Validation loss (optional, can be added later)
+        # val_loss = validate_model(model, valid_dataloader, loss_fn)
         print(f"Epoch {epoch+1}: Loss {total_loss:.4f}")
+
+        # Save model checkpoint
+        checkpoint_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch+1}.pth")
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Checkpoint saved to {checkpoint_path}")
+
+def validate_model(model, dataloader, loss_fn):
+    model.eval()  # Set the model to evaluation mode
+    total_loss = 0
+    with torch.no_grad():  # Disable gradient calculation during validation
+        for src, tgt in dataloader:
+            src, tgt = src.transpose(0, 1).to(DEVICE), tgt.transpose(0, 1).to(DEVICE)
+            tgt_input = tgt[:-1, :]
+            tgt_output = tgt[1:, :]
+
+            src_mask = model.transformer.generate_square_subsequent_mask(src.size(0)).to(DEVICE)
+            tgt_mask = model.transformer.generate_square_subsequent_mask(tgt_input.size(0)).to(DEVICE)
+
+            logits = model(src, tgt_input, src_mask, tgt_mask)
+            loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+            total_loss += loss.item()
+
+    avg_loss = total_loss / len(dataloader)
+    return avg_loss
+
 
 # ----------------------------
 # Step 5: Main
@@ -131,12 +159,15 @@ def main():
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     # 4. Initialize model
-    model = Seq2SeqTransformer(3, 3, 512, VOCAB_SIZE, VOCAB_SIZE).to(DEVICE)
+    src_vocab_size = src_tok.get_piece_size()
+    tgt_vocab_size = tgt_tok.get_piece_size()
+    model = Seq2SeqTransformer(3, 3, 512, src_vocab_size, tgt_vocab_size).to(DEVICE)
     optimizer = Adam(model.parameters(), lr=1e-4)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+    pad_idx = tgt_tok.pad_id() if tgt_tok.pad_id() >= 0 else 0
+    loss_fn = nn.CrossEntropyLoss(ignore_index=pad_idx)
 
     # 5. Train
-    train_model(model, dataloader, optimizer, loss_fn)
+    train_model(model, dataloader, optimizer, loss_fn, pad_idx)
 
     # 6. Save model
     torch.save(model.state_dict(), "transformer_ja_en.pth")
