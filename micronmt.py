@@ -1,161 +1,145 @@
 import os
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-import numpy as np
+import math
+import sentencepiece as spm
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.utils.data import Dataset, DataLoader
 
-# Input/output sentence pairs (English to Japanese)
-import zipfile
+# ----------------------------
+# Configuration
+# ----------------------------
+SRC_LANG = 'ja'
+TGT_LANG = 'en'
+VOCAB_SIZE = 8000
+MAX_LEN = 64
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-dataset_path = "jpn-eng.zip"
-extracted_file = "jpn.txt"
+# ----------------------------
+# Step 1: Train SentencePiece Tokenizers
+# ----------------------------
+def train_tokenizers():
+    if not os.path.exists(f"{SRC_LANG}.model"):
+        spm.SentencePieceTrainer.Train(
+            input=f"{SRC_LANG}.txt", model_prefix=SRC_LANG, vocab_size=VOCAB_SIZE)
+    if not os.path.exists(f"{TGT_LANG}.model"):
+        spm.SentencePieceTrainer.Train(
+            input=f"{TGT_LANG}.txt", model_prefix=TGT_LANG, vocab_size=VOCAB_SIZE)
 
-if not os.path.exists(extracted_file):
-    with zipfile.ZipFile(dataset_path, 'r') as zip_ref:
-        zip_ref.extractall()
-    print("Dataset extracted.")
-else:
-    print("Already extracted.")
+# ----------------------------
+# Step 2: Dataset
+# ----------------------------
+class TranslationDataset(Dataset):
+    def __init__(self, src_lines, tgt_lines, src_tokenizer, tgt_tokenizer):
+        self.src = src_lines
+        self.tgt = tgt_lines
+        self.src_tok = src_tokenizer
+        self.tgt_tok = tgt_tokenizer
 
+    def __len__(self):
+        return len(self.src)
 
+    def encode(self, line, tokenizer):
+        tokens = tokenizer.encode(line)
+        tokens = tokens[:MAX_LEN]
+        tokens += [0] * (MAX_LEN - len(tokens))
+        return torch.tensor(tokens)
 
-# Read and preprocess the data
-input_texts = []
-target_texts = []
+    def __getitem__(self, idx):
+        src_tensor = self.encode(self.src[idx], self.src_tok)
+        tgt_tensor = self.encode(self.tgt[idx], self.tgt_tok)
+        return src_tensor, tgt_tensor
 
-with open(extracted_file, encoding="utf-8") as f:
-    for line in f:
-        eng, jpn, _ = line.strip().split('\t')
-        input_texts.append(eng.lower())
-        target_texts.append(f"<start> {jpn} <end>")
+# ----------------------------
+# Step 3: Transformer Model
+# ----------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, emb_size, dropout, maxlen=MAX_LEN):
+        super().__init__()
+        den = torch.exp(-torch.arange(0, emb_size, 2) * math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(1)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('pos_embedding', pos_embedding)
 
-# (Optional) Subsample for speed during testing
-input_texts = input_texts[:10000]
-target_texts = target_texts[:10000]
+    def forward(self, x):
+        return self.dropout(x + self.pos_embedding[:x.size(0), :])
 
+class Seq2SeqTransformer(nn.Module):
+    def __init__(self, num_encoder_layers, num_decoder_layers, emb_size,
+                 src_vocab_size, tgt_vocab_size, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.transformer = nn.Transformer(d_model=emb_size, nhead=8,
+                                          num_encoder_layers=num_encoder_layers,
+                                          num_decoder_layers=num_decoder_layers,
+                                          dim_feedforward=dim_feedforward,
+                                          dropout=dropout)
+        self.src_emb = nn.Embedding(src_vocab_size, emb_size)
+        self.tgt_emb = nn.Embedding(tgt_vocab_size, emb_size)
+        self.pos_enc = PositionalEncoding(emb_size, dropout)
+        self.fc_out = nn.Linear(emb_size, tgt_vocab_size)
 
-# Tokenizers for both languages
-input_tokenizer = Tokenizer(oov_token="<OOV>", filters='')
-target_tokenizer = Tokenizer(oov_token="<OOV>", filters='')
+    def forward(self, src, tgt, src_mask, tgt_mask):
+        src = self.pos_enc(self.src_emb(src))
+        tgt = self.pos_enc(self.tgt_emb(tgt))
+        outs = self.transformer(src, tgt, src_mask, tgt_mask)
+        return self.fc_out(outs)
 
-input_tokenizer.fit_on_texts(input_texts)
-target_tokenizer.fit_on_texts(target_texts)
+# ----------------------------
+# Step 4: Training
+# ----------------------------
+def train_model(model, dataloader, optimizer, loss_fn):
+    model.train()
+    for epoch in range(10):
+        total_loss = 0
+        for src, tgt in dataloader:
+            src, tgt = src.transpose(0, 1).to(DEVICE), tgt.transpose(0, 1).to(DEVICE)
+            tgt_input = tgt[:-1, :]
+            tgt_output = tgt[1:, :]
 
-# Convert texts to sequences
-input_sequences = input_tokenizer.texts_to_sequences(input_texts)
-target_sequences = target_tokenizer.texts_to_sequences(target_texts)
+            src_mask = model.transformer.generate_square_subsequent_mask(src.size(0)).to(DEVICE)
+            tgt_mask = model.transformer.generate_square_subsequent_mask(tgt_input.size(0)).to(DEVICE)
 
-# Pad sequences
-max_input_len = max(len(seq) for seq in input_sequences)
-max_target_len = max(len(seq) for seq in target_sequences)
+            logits = model(src, tgt_input, src_mask, tgt_mask)
+            optimizer.zero_grad()
+            loss = loss_fn(logits.reshape(-1, logits.shape[-1]), tgt_output.reshape(-1))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}: Loss {total_loss:.4f}")
 
-encoder_input = pad_sequences(input_sequences, maxlen=max_input_len, padding='post')
-decoder_input = pad_sequences([seq[:-1] for seq in target_sequences], maxlen=max_target_len - 1, padding='post')
-decoder_target = pad_sequences([seq[1:] for seq in target_sequences], maxlen=max_target_len - 1, padding='post')
-decoder_target = np.expand_dims(decoder_target, -1)
+# ----------------------------
+# Step 5: Main
+# ----------------------------
+def main():
+    # 1. Train or load tokenizers
+    train_tokenizers()
+    src_tok = spm.SentencePieceProcessor(model_file=f'{SRC_LANG}.model')
+    tgt_tok = spm.SentencePieceProcessor(model_file=f'{TGT_LANG}.model')
 
-# Vocabulary sizes
-input_vocab_sizea = len(input_tokenizer.word_index) + 1
-target_vocab_size = len(target_tokenizer.word_index) + 1
+    # 2. Load parallel data
+    with open(f"{SRC_LANG}.txt", encoding='utf8') as f:
+        src_lines = [line.strip() for line in f]
+    with open(f"{TGT_LANG}.txt", encoding='utf8') as f:
+        tgt_lines = [line.strip() for line in f]
 
+    # 3. Prepare data
+    dataset = TranslationDataset(src_lines, tgt_lines, src_tok, tgt_tok)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-def build_seq2seq_model(input_vocab_size, target_vocab_size, input_len, target_len, embedding_dim=64, latent_dim=256):
-    # Encoder
-    encoder_inputs = layers.Input(shape=(input_len,), name="encoder_inputs")
-    enc_emb = layers.Embedding(input_vocab_size, embedding_dim, name="encoder_embedding")(encoder_inputs)
-    encoder_lstm = layers.LSTM(latent_dim, return_state=True, name="encoder_lstm")
-    encoder_outputs, state_h, state_c = encoder_lstm(enc_emb)
-    encoder_states = [state_h, state_c]
+    # 4. Initialize model
+    model = Seq2SeqTransformer(3, 3, 512, VOCAB_SIZE, VOCAB_SIZE).to(DEVICE)
+    optimizer = Adam(model.parameters(), lr=1e-4)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
-    # Decoder
-    decoder_inputs = layers.Input(shape=(target_len,), name="decoder_inputs")
-    dec_emb_layer = layers.Embedding(target_vocab_size, embedding_dim, name="decoder_embedding")
-    dec_emb = dec_emb_layer(decoder_inputs)
-    decoder_lstm = layers.LSTM(latent_dim, return_sequences=True, return_state=True, name="decoder_lstm")
-    decoder_outputs, _, _ = decoder_lstm(dec_emb, initial_state=encoder_states)
-    decoder_dense = layers.TimeDistributed(layers.Dense(target_vocab_size, activation='softmax'), name="decoder_dense")
-    decoder_outputs = decoder_dense(decoder_outputs)
+    # 5. Train
+    train_model(model, dataloader, optimizer, loss_fn)
 
-    model = models.Model([encoder_inputs, decoder_inputs], decoder_outputs)
+    # 6. Save model
+    torch.save(model.state_dict(), "transformer_ja_en.pth")
 
-    # Save encoder and decoder pieces
-    encoder_model_inputs = encoder_inputs
-    encoder_model_outputs = encoder_states
-
-    decoder_state_input_h = layers.Input(shape=(latent_dim,))
-    decoder_state_input_c = layers.Input(shape=(latent_dim,))
-    decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
-    dec_emb2 = dec_emb_layer(decoder_inputs)
-    decoder_lstm_outputs, state_h, state_c = decoder_lstm(dec_emb2, initial_state=decoder_states_inputs)
-    decoder_states = [state_h, state_c]
-    decoder_outputs_inf = decoder_dense(decoder_lstm_outputs)
-
-    encoder_model = models.Model(encoder_model_inputs, encoder_model_outputs)
-    decoder_model = models.Model(
-        [decoder_inputs] + decoder_states_inputs,
-        [decoder_outputs_inf] + decoder_states
-    )
-
-    return model, encoder_model, decoder_model
-
-
-# Build the training model
-# Build the models
-model, encoder_model, decoder_model = build_seq2seq_model(
-    input_vocab_size=input_vocab_size,
-    target_vocab_size=target_vocab_size,
-    input_len=max_input_len,
-    target_len=max_target_len - 1
-)
-
-
-# Compile model
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-
-# Train
-model.fit([encoder_input, decoder_input], decoder_target, epochs=50, batch_size=32)
-
-# === Inference Setup ===
-
-
-
-# Decoding function
-def decode_sequence(input_seq, max_target_len, start_token, end_token):
-    states_value = encoder_model.predict(input_seq)
-    target_seq = np.array([[target_tokenizer.word_index[start_token]]])
-    decoded_sentence = []
-
-    for _ in range(max_target_len):
-        output_tokens, h, c = decoder_model.predict([target_seq] + states_value)
-        sampled_token_index = np.argmax(output_tokens[0, -1, :])
-        sampled_word = target_tokenizer.index_word.get(sampled_token_index, "")
-
-        if sampled_word == end_token:
-            break
-
-        decoded_sentence.append(sampled_word)
-        target_seq = np.array([[sampled_token_index]])
-        states_value = [h, c]
-
-    return ' '.join(decoded_sentence)
-
-
-# === Test the model with new inputs ===
-print("Translation ready. Type English sentences to translate them to Japanese.")
-print("Type 'exit' to quit.\n")
-
-while True:
-    user_input = input("You: ").strip()
-    if user_input.lower() == 'exit':
-        print("Exiting translation.")
-        break
-
-    # Tokenize and pad the input
-    seq = input_tokenizer.texts_to_sequences([user_input.lower()])
-    padded_seq = pad_sequences(seq, maxlen=max_input_len, padding='post')
-
-    # Translate and print the result
-    translated = decode_sequence(padded_seq, max_target_len, start_token="<start>", end_token="<end>")
-    print("Japanese:", translated, "\n")
-
+if __name__ == "__main__":
+    main()
